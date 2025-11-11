@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"time"
 )
@@ -38,6 +39,23 @@ func RunCommand(ctx context.Context, name string, args ...string) (string, error
 	return stdout.String(), nil
 }
 
+// RunCommandInDir executes a command in a specific working directory
+// SECURITY: Uses exec.CommandContext with separate arguments to prevent command injection
+func RunCommandInDir(ctx context.Context, dir, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("command %q failed: %w\nstderr: %s", name, err, stderr.String())
+	}
+
+	return stdout.String(), nil
+}
+
 // RunCommandWithOutput runs a command and returns both stdout and stderr
 func RunCommandWithOutput(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -57,14 +75,6 @@ func RunCommandWithOutput(ctx context.Context, name string, args ...string) (std
 	return stdout, stderr, err
 }
 
-// RunCommandWithTimeout executes a command with a specific timeout
-func RunCommandWithTimeout(name string, timeout time.Duration, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	return RunCommand(ctx, name, args...)
-}
-
 // GetExitCode extracts the exit code from a command error
 func GetExitCode(err error) int {
 	if err == nil {
@@ -76,6 +86,55 @@ func GetExitCode(err error) int {
 	}
 
 	return -1
+}
+
+// RunCommandStreaming executes a command and streams output to provided writers
+// This avoids buffering large outputs in memory, reducing memory pressure
+// Pass nil for stdout/stderr to discard output (equivalent to > /dev/null)
+// SECURITY: Uses exec.CommandContext with separate arguments to prevent command injection
+func RunCommandStreaming(ctx context.Context, stdout, stderr io.Writer, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command %q failed: %w", name, err)
+	}
+
+	return nil
+}
+
+// RunCommandInDirStreaming executes a command in a specific directory with streaming output
+// SECURITY: Uses exec.CommandContext with separate arguments to prevent command injection
+func RunCommandInDirStreaming(ctx context.Context, dir string, stdout, stderr io.Writer, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command %q failed in dir %q: %w", name, dir, err)
+	}
+
+	return nil
+}
+
+// PrepareCommand prepares a command but does not execute it
+// Callers can configure Stdout/Stderr/Stdin and other settings before calling Run() or Start()
+// This provides maximum flexibility for custom command execution
+// SECURITY: Uses exec.CommandContext with separate arguments to prevent command injection
+func PrepareCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, name, args...)
 }
 
 // ValidateDesktopFile validates a .desktop file and returns warnings/errors

@@ -16,10 +16,10 @@ import (
 
 // Extraction limits to prevent archive bombs
 const (
-	MaxExtractedSize     = 10 * 1024 * 1024 * 1024 // 10GB
-	MaxFileCount         = 100000                   // 100k files
-	MaxCompressionRatio  = 1000                     // 1000:1 ratio
-	MaxIndividualFileSize = 5 * 1024 * 1024 * 1024 // 5GB per file
+	MaxExtractedSize      = 10 * 1024 * 1024 * 1024 // 10GB
+	MaxFileCount          = 100000                  // 100k files
+	MaxCompressionRatio   = 1000                    // 1000:1 ratio
+	MaxIndividualFileSize = 5 * 1024 * 1024 * 1024  // 5GB per file
 )
 
 // extractionLimiter tracks extraction metrics to prevent bombs

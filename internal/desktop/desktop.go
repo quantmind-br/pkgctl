@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/diogo/pkgctl/internal/core"
-	"github.com/diogo/pkgctl/internal/helpers"
 )
 
 // Parse parses a .desktop file from a reader
@@ -150,31 +149,6 @@ func WriteDesktopFile(filePath string, de *core.DesktopEntry) error {
 
 	// Write desktop entry
 	return Write(file, de)
-}
-
-// ValidateAndWarn validates a desktop file and prints warnings to stderr
-// Returns true if validation passed, false if there were errors/warnings
-func ValidateAndWarn(desktopFilePath string) bool {
-	output, isValid, err := helpers.ValidateDesktopFile(desktopFilePath)
-	if err != nil {
-		// Command execution error, just log it
-		fmt.Fprintf(os.Stderr, "⚠  Desktop file validation skipped: %v\n", err)
-		return true // Don't fail installation
-	}
-
-	if output != "" {
-		// There are warnings or errors
-		if isValid {
-			// Warnings only (shouldn't happen with desktop-file-validate, but handle it)
-			fmt.Fprintf(os.Stderr, "⚠  Desktop file warnings:\n%s\n", output)
-		} else {
-			// Errors
-			fmt.Fprintf(os.Stderr, "⚠  Desktop file validation issues:\n%s\n", output)
-		}
-		return false
-	}
-
-	return true
 }
 
 // parseSemicolonList parses semicolon-separated list

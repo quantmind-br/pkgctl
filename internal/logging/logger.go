@@ -1,9 +1,11 @@
 package logging
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/pkgerrors"
@@ -27,7 +29,7 @@ func NewLogger(cfg Config) *zerolog.Logger {
 
 	// Console writer (colored output for TTY)
 	consoleWriter := zerolog.ConsoleWriter{
-		Out:        os.Stderr,
+		Out:        newProgressSafeWriter(os.Stderr),
 		TimeFormat: "15:04:05",
 		NoColor:    cfg.NoColor,
 	}
@@ -62,6 +64,44 @@ func NewLogger(cfg Config) *zerolog.Logger {
 		Logger()
 
 	return &logger
+}
+
+// progressSafeWriter ensures console logs don't overlap with progress bars/spinners.
+// It clears the current terminal line before writing and tracks line boundaries
+// so the clear code runs only once per log entry.
+type progressSafeWriter struct {
+	out       io.Writer
+	lineStart bool
+	mu        sync.Mutex
+	clearSeq  []byte
+}
+
+func newProgressSafeWriter(out io.Writer) *progressSafeWriter {
+	return &progressSafeWriter{
+		out:       out,
+		lineStart: true,
+		clearSeq:  []byte("\r\033[2K"),
+	}
+}
+
+func (w *progressSafeWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.lineStart {
+		if _, err := w.out.Write(w.clearSeq); err != nil {
+			return 0, err
+		}
+		w.lineStart = false
+	}
+
+	n, err := w.out.Write(p)
+
+	if n > 0 && bytes.LastIndexByte(p[:n], '\n') == n-1 {
+		w.lineStart = true
+	}
+
+	return n, err
 }
 
 // parseLevel converts string level to zerolog.Level

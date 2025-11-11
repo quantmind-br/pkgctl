@@ -24,8 +24,8 @@ type PathsConfig struct {
 
 // DesktopConfig contains desktop integration configuration
 type DesktopConfig struct {
-	WaylandEnvVars       bool     `mapstructure:"wayland_env_vars"`
-	CustomEnvVars        []string `mapstructure:"custom_env_vars"`
+	WaylandEnvVars         bool     `mapstructure:"wayland_env_vars"`
+	CustomEnvVars          []string `mapstructure:"custom_env_vars"`
 	ElectronDisableSandbox bool     `mapstructure:"electron_disable_sandbox"`
 }
 

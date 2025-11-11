@@ -17,6 +17,7 @@ import (
 	"github.com/diogo/pkgctl/internal/core"
 	"github.com/diogo/pkgctl/internal/desktop"
 	"github.com/diogo/pkgctl/internal/helpers"
+	"github.com/diogo/pkgctl/internal/ui"
 	"github.com/rs/zerolog"
 )
 
@@ -62,6 +63,24 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 		Str("custom_name", opts.CustomName).
 		Msg("installing DEB package")
 
+	// Define installation phases with weights
+	phases := []ui.InstallationPhase{
+		{"Validating package", 5, true},
+		{"Extracting metadata", 5, true},
+		{"Converting DEB to Arch", 60, false}, // Indeterminate - uses spinner
+		{"Fixing dependencies", 5, true},
+		{"Installing with pacman", 20, false}, // Indeterminate - uses spinner
+		{"Configuring desktop", 5, true},
+	}
+
+	// Create progress tracker (enabled unless in quiet mode)
+	progressEnabled := d.logger.GetLevel() != zerolog.Disabled && d.logger.GetLevel() <= zerolog.InfoLevel
+	progress := ui.NewProgressTracker(phases, "Installing DEB", progressEnabled)
+	defer progress.Finish()
+
+	// Phase 1: Validation
+	progress.StartPhase(0)
+
 	// Check if debtap is installed
 	if err := helpers.RequireCommand("debtap"); err != nil {
 		return nil, fmt.Errorf("debtap is required for DEB installation: %w\nInstall with: yay -S debtap", err)
@@ -81,6 +100,11 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 	if _, err := os.Stat(packagePath); err != nil {
 		return nil, fmt.Errorf("package not found: %w", err)
 	}
+
+	progress.AdvancePhase()
+
+	// Phase 2: Extract metadata
+	progress.StartPhase(1)
 
 	// Determine package name
 	pkgName := opts.CustomName
@@ -117,10 +141,12 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Convert DEB to Arch package using debtap
-	d.logger.Info().Msg("converting DEB to Arch package (this may take a while)...")
+	progress.AdvancePhase()
 
-	archPkgPath, err := d.convertWithDebtap(ctx, packagePath, tmpDir)
+	// Phase 3: Convert DEB to Arch package (indeterminate phase)
+	progress.StartPhase(2)
+
+	archPkgPath, err := d.convertWithDebtapProgress(ctx, packagePath, tmpDir, progress)
 	if err != nil {
 		return nil, fmt.Errorf("debtap conversion failed: %w", err)
 	}
@@ -129,9 +155,13 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 		Str("arch_package", archPkgPath).
 		Msg("DEB converted to Arch package")
 
-	// Fix malformed dependencies caused by debtap epoch parsing issues
+	progress.AdvancePhase()
+
+	// Phase 4: Fix dependencies
+	progress.StartPhase(3)
+
 	d.logger.Info().Msg("checking and fixing malformed dependencies...")
-	if err := fixMalformedDependencies(archPkgPath); err != nil {
+	if err := fixMalformedDependencies(archPkgPath, d.logger); err != nil {
 		d.logger.Warn().Err(err).Msg("failed to fix malformed dependencies, proceeding anyway")
 	}
 
@@ -149,12 +179,29 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 
 	installID := helpers.GenerateInstallID(pacmanPkgName)
 
-	// Install the converted package with pacman
-	d.logger.Info().Msg("installing converted package with pacman...")
+	progress.AdvancePhase()
+
+	// Phase 5: Install with pacman (indeterminate phase)
+	progress.StartPhase(4)
 
 	// Need sudo for pacman
 	installCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+
+	// Update progress during pacman installation
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-ticker.C:
+				progress.UpdateIndeterminateWithElapsed("Installing with pacman", time.Since(start))
+			case <-installCtx.Done():
+				return
+			}
+		}
+	}()
 
 	_, err = helpers.RunCommand(installCtx, "sudo", "pacman", "-U", "--noconfirm", archPkgPath)
 	if err != nil {
@@ -162,6 +209,11 @@ func (d *DebBackend) Install(ctx context.Context, packagePath string, opts core.
 	}
 
 	d.logger.Info().Msg("package installed successfully via pacman")
+
+	progress.AdvancePhase()
+
+	// Phase 6: Desktop integration
+	progress.StartPhase(5)
 
 	// Get package info from pacman
 	pkgInfo, err := d.getPackageInfo(ctx, pacmanPkgName)
@@ -302,8 +354,8 @@ func (d *DebBackend) Uninstall(ctx context.Context, record *core.InstallRecord) 
 	return nil
 }
 
-// convertWithDebtap converts a DEB package to Arch package
-func (d *DebBackend) convertWithDebtap(ctx context.Context, debPath, outputDir string) (string, error) {
+// convertWithDebtapProgress converts a DEB package to Arch package with progress tracking
+func (d *DebBackend) convertWithDebtapProgress(ctx context.Context, debPath, outputDir string, progress *ui.ProgressTracker) (string, error) {
 	// Run debtap with quiet mode (-q) and skip interactive prompts (-Q)
 	convertCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
@@ -373,14 +425,13 @@ func (d *DebBackend) convertWithDebtap(ctx context.Context, debPath, outputDir s
 	start := time.Now()
 	progressDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				d.logger.Info().
-					Dur("elapsed", time.Since(start)).
-					Msg("debtap conversion in progress")
+				// Update progress bar with spinner and elapsed time
+				progress.UpdateIndeterminateWithElapsed("Converting DEB to Arch", time.Since(start))
 			case <-progressDone:
 				return
 			}
@@ -699,7 +750,7 @@ func extractPackageInfoFromArchive(pkgPath string) (*packageInfo, error) {
 
 // fixMalformedDependencies corrects common dependency name issues from debtap conversion
 // This addresses issues where epoch versions (like 2:1.4.99.1) cause name mangling
-func fixMalformedDependencies(pkgPath string) error {
+func fixMalformedDependencies(pkgPath string, logger *zerolog.Logger) error {
 	// Extract the package to a temp directory
 	tmpDir, err := os.MkdirTemp("", "pkgctl-fix-deps-*")
 	if err != nil {
@@ -729,13 +780,20 @@ func fixMalformedDependencies(pkgPath string) error {
 
 	for _, line := range lines {
 		if strings.HasPrefix(line, "depend = ") {
-			fixedLine := fixDependencyLine(line)
+			fixedLine := fixDependencyLine(line, logger)
 			if fixedLine == "" {
 				// Dependency should be removed
+				logger.Debug().
+					Str("removed_dependency", strings.TrimPrefix(line, "depend = ")).
+					Msg("removing invalid dependency")
 				hasChanges = true
 				continue
 			}
 			if fixedLine != line {
+				logger.Debug().
+					Str("original", strings.TrimPrefix(line, "depend = ")).
+					Str("fixed", strings.TrimPrefix(fixedLine, "depend = ")).
+					Msg("dependency mapping applied")
 				hasChanges = true
 			}
 			fixed = append(fixed, fixedLine)
@@ -783,7 +841,7 @@ func fixMalformedDependencies(pkgPath string) error {
 
 // fixDependencyLine corrects a single dependency line with known malformations
 // Returns empty string if dependency should be removed
-func fixDependencyLine(line string) string {
+func fixDependencyLine(line string, logger *zerolog.Logger) string {
 	// Extract the dependency part after "depend = "
 	if !strings.HasPrefix(line, "depend = ") {
 		return line
@@ -800,10 +858,12 @@ func fixDependencyLine(line string) string {
 
 	// Check if this dependency should be removed entirely
 	depName := dep
+	versionConstraint := ""
 	// Extract just the package name (before any version operator)
 	for _, op := range []string{">=", "<=", "=", ">", "<"} {
 		if idx := strings.Index(dep, op); idx != -1 {
 			depName = dep[:idx]
+			versionConstraint = dep[idx:]
 			break
 		}
 	}
@@ -812,6 +872,32 @@ func fixDependencyLine(line string) string {
 		if strings.HasPrefix(depName, invalid) {
 			return "" // Empty string signals removal
 		}
+	}
+
+	// Debian/Ubuntu → Arch package name mapping
+	// Many Debian packages have different names in Arch repos
+	debianToArchMap := map[string]string{
+		"gtk":        "gtk3",          // Generic GTK → GTK3 (most compatible)
+		"gtk2.0":     "gtk2",          // Debian GTK2 naming
+		"gtk-3.0":    "gtk3",          // Debian GTK3 naming variant
+		"python3":    "python",        // Arch uses "python" for Python 3
+		"nodejs":     "nodejs",        // Same but good to document
+		"libssl":     "openssl",       // SSL library naming
+		"libssl1.1":  "openssl",       // Specific SSL version
+		"libssl3":    "openssl",       // OpenSSL 3.x
+		"libjpeg":    "libjpeg-turbo", // JPEG library
+		"libpng":     "libpng",        // Same but documented
+		"libpng16":   "libpng",        // Specific version to generic
+		"zlib1g":     "zlib",          // Debian zlib naming
+		"libcurl":    "curl",          // Curl library
+		"libcurl4":   "curl",          // Curl 4.x
+		"libglib2.0": "glib2",         // GLib naming difference
+		"libnotify4": "libnotify",     // Remove version suffix
+	}
+
+	// Apply Debian→Arch mapping if needed
+	if archName, exists := debianToArchMap[depName]; exists {
+		return "depend = " + archName + versionConstraint
 	}
 
 	// Pattern-based fixes

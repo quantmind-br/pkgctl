@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,7 +62,7 @@ func NewUninstallCmd(cfg *config.Config, log *zerolog.Logger) *cobra.Command {
 }
 
 func runInteractiveUninstall(ctx context.Context, database *db.DB, registry *backends.Registry, log *zerolog.Logger) error {
-	color.Cyan("→ Loading installed packages...")
+	color.Cyan("🔍 Loading installed packages...")
 
 	installs, err := database.List(ctx)
 	if err != nil {
@@ -73,11 +75,22 @@ func runInteractiveUninstall(ctx context.Context, database *db.DB, registry *bac
 		return nil
 	}
 
+	color.Green("✓ Found %d installed packages\n", len(installs))
+	color.Cyan("📦 Use fuzzy search to filter packages (type to search)")
+	color.Cyan("   Press '/' to start searching, ↑↓ to navigate, Enter to select\n")
+
 	options := make([]string, 0, len(installs))
 	optionMap := make(map[string]db.Install, len(installs))
 
 	for _, install := range installs {
-		label := fmt.Sprintf("%s (%s) [%s]", install.Name, install.PackageType, install.InstallID)
+		// Don't calculate size here to avoid UI delay
+		// Size will be calculated only for selected packages
+		dateStr := install.InstallDate.Format("2006-01-02")
+		label := fmt.Sprintf("%s (%s) - %s",
+			install.Name,
+			install.PackageType,
+			dateStr,
+		)
 		options = append(options, label)
 		optionMap[label] = install
 	}
@@ -93,11 +106,56 @@ func runInteractiveUninstall(ctx context.Context, database *db.DB, registry *bac
 		return nil
 	}
 
-	color.Cyan("→ Preparing to uninstall %d package(s)...", len(selectedLabels))
+	// Show summary and confirmation
+	fmt.Println()
+	color.Cyan("📋 Selected %d package(s) for uninstallation:", len(selectedLabels))
+	color.Cyan("📏 Calculating sizes...")
 
+	// Calculate sizes only for selected packages
+	var totalSize int64
+	sizeMap := make(map[string]int64, len(selectedLabels))
 	for _, label := range selectedLabels {
 		install := optionMap[label]
+		size := int64(0)
+		if install.InstallPath != "" {
+			size, _ = calculatePackageSize(install.InstallPath)
+		}
+		sizeMap[label] = size
+		totalSize += size
+	}
+
+	fmt.Println()
+	for _, label := range selectedLabels {
+		install := optionMap[label]
+		size := sizeMap[label]
+		fmt.Printf("   • %s (%s) - %s\n", install.Name, install.PackageType, formatBytes(size))
+	}
+	fmt.Printf("\n💾 Total space to free: %s\n\n", formatBytes(totalSize))
+
+	// Confirmation
+	color.Yellow("⚠️  This action cannot be undone!")
+	confirmed, err := ui.ConfirmPrompt("Are you sure you want to uninstall these packages?")
+	if err != nil {
+		color.Yellow("Confirmation cancelled. No packages were uninstalled.")
+		return nil
+	}
+	if !confirmed {
+		color.Yellow("Uninstallation cancelled by user.")
+		return nil
+	}
+
+	// Uninstall packages
+	fmt.Println()
+	color.Cyan("🚀 Starting uninstallation...\n")
+
+	successCount := 0
+	failureCount := 0
+
+	for i, label := range selectedLabels {
+		install := optionMap[label]
 		record := dbInstallToCore(&install)
+
+		fmt.Printf("[%d/%d] ", i+1, len(selectedLabels))
 
 		log.Info().
 			Str("install_id", record.InstallID).
@@ -105,11 +163,22 @@ func runInteractiveUninstall(ctx context.Context, database *db.DB, registry *bac
 			Msg("starting uninstallation")
 
 		if err := performUninstall(ctx, registry, database, log, record); err != nil {
-			return err
+			failureCount++
+			continue
 		}
+		successCount++
 	}
 
-	color.Green("✓ Uninstallation complete for %d package(s)", len(selectedLabels))
+	// Summary
+	fmt.Println()
+	if failureCount > 0 {
+		color.Yellow("⚠️  Uninstallation completed with errors:")
+		color.Green("   ✓ Successful: %d", successCount)
+		color.Red("   ✗ Failed: %d", failureCount)
+	} else {
+		color.Green("✓ Successfully uninstalled all %d package(s)!", successCount)
+	}
+
 	return nil
 }
 
@@ -217,4 +286,49 @@ func dbInstallToCore(dbRecord *db.Install) *core.InstallRecord {
 	}
 
 	return record
+}
+
+// formatBytes formats a byte size in human readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// calculatePackageSize calculates the total size and file count of a package
+func calculatePackageSize(installPath string) (int64, int) {
+	var totalSize int64
+	var fileCount int
+
+	// Check if path exists
+	info, err := os.Stat(installPath)
+	if err != nil {
+		return 0, 0
+	}
+
+	// If it's a single file
+	if !info.IsDir() {
+		return info.Size(), 1
+	}
+
+	// If it's a directory, walk through it
+	filepath.Walk(installPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+			fileCount++
+		}
+		return nil
+	})
+
+	return totalSize, fileCount
 }

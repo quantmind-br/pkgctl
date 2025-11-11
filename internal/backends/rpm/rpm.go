@@ -3,6 +3,7 @@ package rpm
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -920,13 +921,25 @@ func copyDir(src, dst string) error {
 			return os.Symlink(linkTarget, dstPath)
 		}
 
-		// Handle regular files
-		data, err := os.ReadFile(path)
+		// Handle regular files using streaming to avoid loading entire file in memory
+		srcFile, err := os.Open(path)
 		if err != nil {
 			// Skip files that can't be read
 			return nil
 		}
+		defer srcFile.Close()
 
-		return os.WriteFile(dstPath, data, info.Mode())
+		dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return fmt.Errorf("failed to create destination file: %w", err)
+		}
+		defer dstFile.Close()
+
+		// Use io.Copy for efficient streaming copy
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			return fmt.Errorf("failed to copy file data: %w", err)
+		}
+
+		return nil
 	})
 }

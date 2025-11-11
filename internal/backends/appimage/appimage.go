@@ -249,24 +249,11 @@ func (a *AppImageBackend) extractAppImage(ctx context.Context, appImagePath, des
 		return fmt.Errorf("failed to resolve AppImage path: %w", err)
 	}
 
-	// Change to destination directory for extraction
-	originalDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get working directory: %w", err)
-	}
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	if err := os.Chdir(destDir); err != nil {
-		return fmt.Errorf("failed to change to destination directory: %w", err)
-	}
-
-	// Try --appimage-extract first
+	// Try --appimage-extract first (runs in destDir)
 	extractCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	_, err = helpers.RunCommand(extractCtx, absAppImagePath, "--appimage-extract")
+	_, err = helpers.RunCommandInDir(extractCtx, destDir, absAppImagePath, "--appimage-extract")
 	if err == nil {
 		return nil
 	}

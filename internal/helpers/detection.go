@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -135,10 +134,33 @@ func DetectFileType(filePath string) (FileType, error) {
 }
 
 // IsELF checks if a file is a valid ELF executable
+// Uses fast-path magic number check before expensive elf.Open parsing
 func IsELF(filePath string) (bool, error) {
+	// OPTIMIZATION: Fast-path check - read first 4 bytes for ELF magic
+	// This avoids expensive elf.Open() parsing for non-ELF files
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, nil // Can't open, not an ELF
+	}
+	defer file.Close()
+
+	// Read ELF magic: 0x7F 'E' 'L' 'F'
+	magic := make([]byte, 4)
+	n, err := file.Read(magic)
+	if err != nil || n < 4 {
+		return false, nil // Can't read magic, not an ELF
+	}
+
+	// Quick reject if not ELF magic
+	if !bytes.Equal(magic, []byte{0x7F, 'E', 'L', 'F'}) {
+		return false, nil
+	}
+
+	// Magic matches, now do full ELF validation with elf.Open
+	// This parses headers, sections, and symbols to ensure it's valid
 	f, err := elf.Open(filePath)
 	if err != nil {
-		return false, nil // Not an ELF file, not an error
+		return false, nil // Invalid ELF structure
 	}
 	defer f.Close()
 
@@ -227,68 +249,6 @@ func GetArchiveType(filePath string) string {
 	}
 	if strings.HasSuffix(lower, ".zip") {
 		return "zip"
-	}
-
-	return ""
-}
-
-// IsExecutable checks if a file has execute permissions
-func IsExecutable(filePath string) (bool, error) {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return false, err
-	}
-
-	mode := info.Mode()
-	return mode&0111 != 0, nil
-}
-
-// MakeExecutable sets the executable bit on a file
-func MakeExecutable(filePath string) error {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return err
-	}
-
-	// Add execute permissions for owner, group, and others
-	newMode := info.Mode() | 0111
-	return os.Chmod(filePath, newMode)
-}
-
-// ExtractVersionFromFilename attempts to extract a version string from a filename
-// Supports common version patterns like:
-// - myapp-1.2.3.tar.gz -> "1.2.3"
-// - myapp_v2.0.1.AppImage -> "2.0.1"
-// - MyApp-3.14.159-x86_64.tar.gz -> "3.14.159"
-func ExtractVersionFromFilename(filename string) string {
-	// Remove file extensions first
-	name := strings.ToLower(filepath.Base(filename))
-	name = strings.TrimSuffix(name, ".appimage")
-	name = strings.TrimSuffix(name, ".tar.gz")
-	name = strings.TrimSuffix(name, ".tar.xz")
-	name = strings.TrimSuffix(name, ".tar.bz2")
-	name = strings.TrimSuffix(name, ".tgz")
-	name = strings.TrimSuffix(name, ".tar")
-	name = strings.TrimSuffix(name, ".zip")
-	name = strings.TrimSuffix(name, ".deb")
-	name = strings.TrimSuffix(name, ".rpm")
-
-	// Common version patterns (ordered by specificity)
-	patterns := []string{
-		// Semantic versioning with optional v prefix and suffixes
-		`v?(\d+\.\d+\.\d+(?:\.\d+)?(?:-(?:alpha|beta|rc|dev)\d*)?(?:\+[a-z0-9]+)?)`,
-		// Two-part version
-		`v?(\d+\.\d+)(?:[^0-9]|$)`,
-		// Single number version
-		`v?(\d+)(?:[^0-9]|$)`,
-	}
-
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(name)
-		if len(matches) >= 2 && matches[1] != "" {
-			return matches[1]
-		}
 	}
 
 	return ""

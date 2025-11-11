@@ -4,182 +4,337 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 )
 
-// ProgressBar wraps progressbar/v3 with pkgctl styling
-type ProgressBar struct {
-	bar *progressbar.ProgressBar
+const (
+	ansiClearLine                = "\r\033[2K"
+	deterministicRefreshInterval = time.Second
+)
+
+// InstallationPhase represents a phase in the installation process
+type InstallationPhase struct {
+	Name          string
+	Weight        int  // Relative weight (sum should be 100)
+	Deterministic bool // true = progress bar | false = spinner
 }
 
-// NewProgressBar creates a new progress bar for a known-length operation
-func NewProgressBar(max int64, description string) *ProgressBar {
-	bar := progressbar.NewOptions64(max,
+// ProgressTracker manages installation progress with hybrid approach
+type ProgressTracker struct {
+	bar            *progressbar.ProgressBar
+	currentPhase   int
+	phases         []InstallationPhase
+	totalWeight    int
+	startTime      time.Time
+	enabled        bool
+	lastUpdate     time.Time
+	spinnerFrames  []string
+	spinnerIndex   int
+	inSpinnerMode  bool
+	originalWriter io.Writer
+	refreshStop    chan struct{}
+}
+
+// NewProgressTracker creates a new progress tracker with phases
+func NewProgressTracker(phases []InstallationPhase, description string, enabled bool) *ProgressTracker {
+	if !enabled {
+		return &ProgressTracker{
+			enabled: false,
+			phases:  phases,
+		}
+	}
+
+	totalWeight := 0
+	for _, p := range phases {
+		totalWeight += p.Weight
+	}
+
+	writer := os.Stderr
+
+	bar := progressbar.NewOptions(totalWeight,
 		progressbar.OptionSetDescription(description),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
+		progressbar.OptionSetWriter(writer),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionUseANSICodes(true),
 		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
+			Saucer:        "■",
+			SaucerPadding: "░",
 			BarStart:      "[",
 			BarEnd:        "]",
 		}),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionClearOnFinish(),
 		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(os.Stderr, "\n")
+			fmt.Fprint(writer, "\n")
 		}),
-		progressbar.OptionSetRenderBlankState(true),
 	)
 
-	return &ProgressBar{bar: bar}
+	return &ProgressTracker{
+		bar:         bar,
+		phases:      phases,
+		totalWeight: totalWeight,
+		startTime:   time.Now(),
+		enabled:     true,
+		lastUpdate:  time.Now(),
+		spinnerFrames: []string{
+			"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+		},
+		spinnerIndex:   0,
+		inSpinnerMode:  false,
+		originalWriter: writer,
+	}
 }
 
-// NewProgressBarBytes creates a progress bar optimized for byte operations (downloads, etc.)
-func NewProgressBarBytes(max int64, description string) *ProgressBar {
-	bar := progressbar.DefaultBytes(max, description)
-	return &ProgressBar{bar: bar}
+// StartPhase starts a new installation phase
+func (p *ProgressTracker) StartPhase(phaseIndex int) {
+	if !p.enabled {
+		return
+	}
+
+	if phaseIndex < 0 || phaseIndex >= len(p.phases) {
+		return
+	}
+
+	phase := p.phases[phaseIndex]
+	p.currentPhase = phaseIndex
+
+	if phase.Deterministic {
+		// Restore progressbar if coming from spinner mode
+		if p.inSpinnerMode {
+			p.bar.ChangeMax(p.totalWeight) // Reset progressbar
+			p.inSpinnerMode = false
+		}
+		p.bar.Describe(fmt.Sprintf("%s", phase.Name))
+		p.startDeterministicRefresh(phase.Name)
+	} else {
+		p.stopDeterministicRefresh()
+		// Entering spinner mode - allocate dedicated line beneath progress bar
+		if !p.inSpinnerMode {
+			fmt.Fprint(p.originalWriter, "\n")
+			p.inSpinnerMode = true
+		}
+
+		// Spinner mode for indeterminate phases
+		p.spinnerIndex = 0
+		p.lastUpdate = time.Now()
+		// Print initial spinner message directly
+		p.clearLine()
+		line := fmt.Sprintf("%s %s", p.getSpinner(), phase.Name)
+		fmt.Fprint(p.originalWriter, line)
+	}
 }
 
-// NewIndeterminateProgressBar creates a spinner for unknown-length operations
-func NewIndeterminateProgressBar(description string) *ProgressBar {
-	bar := progressbar.NewOptions(-1,
-		progressbar.OptionSetDescription(description),
-		progressbar.OptionSetWidth(10),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionSetRenderBlankState(true),
-	)
+// AdvancePhase completes current phase and moves to next
+func (p *ProgressTracker) AdvancePhase() {
+	if !p.enabled {
+		return
+	}
 
-	return &ProgressBar{bar: bar}
+	if p.currentPhase < 0 || p.currentPhase >= len(p.phases) {
+		return
+	}
+
+	// If completing an indeterminate phase, clear spinner line and move on
+	if p.inSpinnerMode {
+		p.clearLine()
+		fmt.Fprint(p.originalWriter, "\n")
+		p.inSpinnerMode = false
+	} else {
+		p.stopDeterministicRefresh()
+		// Add weight of completed phase only if not in spinner mode
+		currentWeight := p.phases[p.currentPhase].Weight
+		_ = p.bar.Add(currentWeight)
+	}
+
+	// Move to next phase
+	p.currentPhase++
+	if p.currentPhase < len(p.phases) {
+		p.StartPhase(p.currentPhase)
+	}
 }
 
-// Write implements io.Writer for streaming operations
-func (p *ProgressBar) Write(b []byte) (int, error) {
-	return p.bar.Write(b)
+// UpdateIndeterminate updates message for indeterminate phases (with spinner animation)
+func (p *ProgressTracker) UpdateIndeterminate(message string) {
+	if !p.enabled {
+		return
+	}
+
+	// Throttle updates to avoid excessive rendering
+	now := time.Now()
+	if now.Sub(p.lastUpdate) < 100*time.Millisecond {
+		return
+	}
+	p.lastUpdate = now
+
+	// Update spinner animation
+	p.spinnerIndex = (p.spinnerIndex + 1) % len(p.spinnerFrames)
+
+	elapsed := time.Since(p.startTime)
+
+	// Clear previous line and write spinner update in-place
+	p.clearLine()
+	fmt.Fprintf(p.originalWriter, "%s %s (elapsed: %s)",
+		p.getSpinner(),
+		message,
+		formatDuration(elapsed))
 }
 
-// Add increments the progress bar by n
-func (p *ProgressBar) Add(n int) error {
-	return p.bar.Add(n)
+// UpdateIndeterminateWithElapsed updates with custom elapsed time display
+func (p *ProgressTracker) UpdateIndeterminateWithElapsed(message string, elapsed time.Duration) {
+	if !p.enabled {
+		return
+	}
+
+	now := time.Now()
+	if now.Sub(p.lastUpdate) < 100*time.Millisecond {
+		return
+	}
+	p.lastUpdate = now
+
+	p.spinnerIndex = (p.spinnerIndex + 1) % len(p.spinnerFrames)
+
+	// Clear previous line and write spinner update in-place
+	p.clearLine()
+	fmt.Fprintf(p.originalWriter, "%s %s (elapsed: %s)",
+		p.getSpinner(),
+		message,
+		formatDuration(elapsed))
 }
 
-// Add64 increments the progress bar by n (64-bit)
-func (p *ProgressBar) Add64(n int64) error {
-	return p.bar.Add64(n)
-}
+// SetProgress sets progress for deterministic phases
+func (p *ProgressTracker) SetProgress(current, total int) {
+	if !p.enabled || p.currentPhase < 0 || p.currentPhase >= len(p.phases) {
+		return
+	}
 
-// Set sets the current progress to n
-func (p *ProgressBar) Set(n int) error {
-	return p.bar.Set(n)
-}
+	phase := p.phases[p.currentPhase]
+	if !phase.Deterministic {
+		return
+	}
 
-// Set64 sets the current progress to n (64-bit)
-func (p *ProgressBar) Set64(n int64) error {
-	return p.bar.Set64(n)
+	// Calculate progress within current phase's weight
+	if total > 0 {
+		phaseProgress := (current * phase.Weight) / total
+		_ = p.bar.Set(p.getCompletedWeight() + phaseProgress)
+	}
 }
 
 // Finish completes the progress bar
-func (p *ProgressBar) Finish() error {
-	return p.bar.Finish()
-}
+func (p *ProgressTracker) Finish() {
+	if !p.enabled {
+		return
+	}
 
-// Clear clears the progress bar
-func (p *ProgressBar) Clear() error {
-	return p.bar.Clear()
-}
+	p.stopDeterministicRefresh()
 
-// Describe changes the description of the progress bar
-func (p *ProgressBar) Describe(description string) {
-	p.bar.Describe(description)
-}
-
-// IsFinished returns true if the progress bar is finished
-func (p *ProgressBar) IsFinished() bool {
-	return p.bar.IsFinished()
-}
-
-// ProgressReader wraps an io.Reader with a progress bar
-type ProgressReader struct {
-	reader io.Reader
-	bar    *ProgressBar
-}
-
-// NewProgressReader creates a new reader with progress tracking
-func NewProgressReader(reader io.Reader, max int64, description string) *ProgressReader {
-	return &ProgressReader{
-		reader: reader,
-		bar:    NewProgressBarBytes(max, description),
+	// If finishing in spinner mode, just add newline
+	if p.inSpinnerMode {
+		p.clearLine()
+		fmt.Fprintln(p.originalWriter)
+		p.inSpinnerMode = false
+	} else {
+		_ = p.bar.Finish()
 	}
 }
 
-// Read implements io.Reader with progress tracking
-func (pr *ProgressReader) Read(p []byte) (int, error) {
-	n, err := pr.reader.Read(p)
-	if n > 0 {
-		pr.bar.Add(n)
+// Clear clears the progress bar from terminal
+func (p *ProgressTracker) Clear() {
+	if !p.enabled {
+		return
 	}
-	return n, err
+
+	p.stopDeterministicRefresh()
+	_ = p.bar.Clear()
 }
 
-// Close closes the progress bar
-func (pr *ProgressReader) Close() error {
-	return pr.bar.Finish()
+// IsEnabled returns whether progress tracking is enabled
+func (p *ProgressTracker) IsEnabled() bool {
+	return p.enabled
 }
 
-// ProgressWriter wraps an io.Writer with a progress bar
-type ProgressWriter struct {
-	writer io.Writer
-	bar    *ProgressBar
-}
-
-// NewProgressWriter creates a new writer with progress tracking
-func NewProgressWriter(writer io.Writer, max int64, description string) *ProgressWriter {
-	return &ProgressWriter{
-		writer: writer,
-		bar:    NewProgressBarBytes(max, description),
+// getSpinner returns current spinner frame
+func (p *ProgressTracker) getSpinner() string {
+	if p.spinnerIndex < 0 || p.spinnerIndex >= len(p.spinnerFrames) {
+		p.spinnerIndex = 0
 	}
+	return p.spinnerFrames[p.spinnerIndex]
 }
 
-// Write implements io.Writer with progress tracking
-func (pw *ProgressWriter) Write(p []byte) (int, error) {
-	n, err := pw.writer.Write(p)
-	if n > 0 {
-		pw.bar.Add(n)
+// getCompletedWeight calculates total weight of completed phases
+func (p *ProgressTracker) getCompletedWeight() int {
+	if p.currentPhase < 0 {
+		return 0
 	}
-	return n, err
-}
 
-// Close closes the progress bar
-func (pw *ProgressWriter) Close() error {
-	return pw.bar.Finish()
-}
-
-// MultiProgressBar manages multiple progress bars
-type MultiProgressBar struct {
-	bars []*ProgressBar
-}
-
-// NewMultiProgressBar creates a new multi-progress bar manager
-func NewMultiProgressBar() *MultiProgressBar {
-	return &MultiProgressBar{
-		bars: make([]*ProgressBar, 0),
+	total := 0
+	for i := 0; i < p.currentPhase && i < len(p.phases); i++ {
+		total += p.phases[i].Weight
 	}
+	return total
 }
 
-// AddBar adds a progress bar to the manager
-func (m *MultiProgressBar) AddBar(max int64, description string) *ProgressBar {
-	bar := NewProgressBar(max, description)
-	m.bars = append(m.bars, bar)
-	return bar
+// formatDuration formats duration in human-readable form
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
-// FinishAll finishes all progress bars
-func (m *MultiProgressBar) FinishAll() error {
-	for _, bar := range m.bars {
-		if err := bar.Finish(); err != nil {
-			return err
+// NewSimpleSpinner creates a simple spinner for quick operations
+func NewSimpleSpinner(message string) *ProgressTracker {
+	phases := []InstallationPhase{
+		{Name: message, Weight: 100, Deterministic: false},
+	}
+	tracker := NewProgressTracker(phases, "", true)
+	tracker.StartPhase(0)
+	return tracker
+}
+
+// clearLine erases the current terminal line without creating newlines
+func (p *ProgressTracker) clearLine() {
+	if !p.enabled || p.originalWriter == nil {
+		return
+	}
+	fmt.Fprint(p.originalWriter, ansiClearLine)
+}
+
+func (p *ProgressTracker) startDeterministicRefresh(description string) {
+	if !p.enabled || p.bar == nil {
+		return
+	}
+
+	p.stopDeterministicRefresh()
+
+	stopCh := make(chan struct{})
+	p.refreshStop = stopCh
+	ticker := time.NewTicker(deterministicRefreshInterval)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				p.bar.Describe(description)
+			case <-stopCh:
+				ticker.Stop()
+				return
+			}
 		}
+	}()
+}
+
+func (p *ProgressTracker) stopDeterministicRefresh() {
+	if p.refreshStop == nil {
+		return
 	}
-	return nil
+	close(p.refreshStop)
+	p.refreshStop = nil
 }
